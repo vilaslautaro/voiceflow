@@ -10,3 +10,4 @@ openai>=1.0.0
 anthropic>=0.40.0
 deepgram-sdk>=6.0.0
 customtkinter>=5.2.0
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"

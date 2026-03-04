@@ -1,19 +1,22 @@
 # VoiceFlow
 
-**Open-source real-time voice-to-text desktop app for Windows.** Dictate into any application with a global hotkey. Supports local and cloud STT engines, offline translation, and AI-powered text polishing.
+**Open-source real-time voice-to-text desktop app for Windows and macOS.** Dictate into any application with a global hotkey. Supports local and cloud STT engines, offline translation, and AI-powered text polishing.
 
 ---
 
 ## Features
 
 - **Real-time speech-to-text** with multiple STT engines (local & cloud)
-- **Global hotkey** (Ctrl+Win) — works from any application, push-to-talk or toggle mode
+- **Global hotkey** — works from any application, push-to-talk or toggle mode
+  - Windows: **Ctrl + Win**
+  - macOS: **Ctrl + Cmd**
 - **Direct typing** into the active window (like Wispr Flow)
 - **Offline translation** between 10+ languages via ArgosTranslate
 - **AI text polishing** — removes filler words, fixes grammar automatically
 - **Floating overlay** with real-time audio waveform visualization
 - **System audio capture** (loopback) in addition to microphone
 - **OLED-optimized dark UI** built with CustomTkinter
+- **Cross-platform** — Windows 10/11 and macOS 12+
 
 ## STT Engines
 
@@ -50,8 +53,14 @@ pip install -r requirements.txt
 ### Requirements
 
 - Python 3.10+
-- Windows 10/11
+- **Windows** 10/11 or **macOS** 12+ (Monterey or later)
 - Microphone (for voice dictation)
+
+### macOS Setup
+
+1. **Accessibility permissions** — Required for the global hotkey to work. Go to **System Settings > Privacy & Security > Accessibility** and add your terminal app (Terminal, iTerm2, etc.) or Python.
+
+2. **System audio capture** (optional) — Loopback audio on macOS requires a virtual audio device such as [BlackHole](https://github.com/ExistentialAudio/BlackHole). Install it to use the "Audio PC" source.
 
 ## Usage
 
@@ -59,17 +68,17 @@ pip install -r requirements.txt
 # From terminal
 python main.py
 
-# Or double-click "VoiceFlow.bat" (Windows, no console)
+# Windows: double-click "VoiceFlow.bat" (no console)
 ```
 
 ### Controls
 
-| Action | How |
-|---|---|
-| Start/stop recording | **Ctrl + Win** (toggle mode) |
-| Push-to-talk | **Hold Ctrl + Win**, release to stop |
-| Floating overlay | Always visible, click to record |
-| Audio source | Microphone or system audio (loopback) |
+| Action | Windows | macOS |
+|---|---|---|
+| Start/stop recording (toggle) | **Ctrl + Win** | **Ctrl + Cmd** |
+| Push-to-talk (hold to talk) | **Hold Ctrl + Win** | **Hold Ctrl + Cmd** |
+| Floating overlay | Always visible, click to record | Same |
+| Audio source | Microphone or system audio (loopback) | Microphone (loopback requires BlackHole) |
 
 ### Cloud Engines Setup
 
@@ -82,7 +91,7 @@ For **AI polishing** (OpenAI/Anthropic): Configure API keys via the "Config AI" 
 ```
 voiceflow/
 ├── main.py                 # Entry point
-├── hotkey_hook.py          # Native Win32 keyboard hook (Ctrl+Win)
+├── hotkey_hook.py          # Cross-platform keyboard hook (Win32 / Quartz)
 ├── gui/app.py              # Desktop UI (CustomTkinter)
 ├── audio/capture.py        # Audio capture (mic + system loopback)
 ├── engines/                # STT engines
@@ -107,7 +116,10 @@ voiceflow/
 4. **AI polishing** (optional) — Sends transcription to an LLM to clean up filler words and fix grammar
 5. **Output** — Displays text in the app and optionally types it directly into the active window
 
-The native Win32 keyboard hook (`WH_KEYBOARD_LL`) intercepts the Ctrl+Win hotkey at the OS level, suppressing it before Windows can process it (preventing Start menu, Live Captions, etc.).
+### Platform-specific details
+
+- **Windows**: A native Win32 keyboard hook (`WH_KEYBOARD_LL`) intercepts the Ctrl+Win hotkey at the OS level, suppressing it before Windows can process it (preventing Start menu, Live Captions, etc.).
+- **macOS**: A Quartz CGEventTap intercepts the Ctrl+Cmd hotkey at the session level. Requires Accessibility permissions to function.
 
 ## License
 

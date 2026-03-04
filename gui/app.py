@@ -1,4 +1,3 @@
-import ctypes
 import sys
 import threading
 import time
@@ -12,7 +11,24 @@ from audio.capture import AudioCapture, LoopbackCapture, list_input_devices
 from engines import get_available_engines
 from engines.base import STTEngine
 from postprocessing.providers import get_available_editors
+from datetime import datetime
 from postprocessing.config import get_config, save_config, get_api_key, save_api_key
+from postprocessing.history import (
+    load_history, create_session, add_entry, update_entry_polished,
+    finalize_session, save_session_to_history, delete_session,
+    clear_history, get_session_preview,
+)
+from audio.sounds import play_sound
+from hotkey_hook import HotkeyHook, format_hotkey_display, DEFAULT_HOTKEY, HOTKEY_PRESETS
+
+# Cross-platform detection
+_IS_MAC = sys.platform == "darwin"
+_IS_WIN = sys.platform == "win32"
+
+# Cross-platform font families
+_UI = "Helvetica Neue" if _IS_MAC else "Segoe UI"
+_UI_SEMI = "Helvetica Neue" if _IS_MAC else "Segoe UI Semibold"
+_MONO = "Menlo" if _IS_MAC else "Cascadia Code"
 
 LANGUAGE_MAP = {
     "Auto": None,
@@ -52,13 +68,13 @@ COLORS = {
     "section_header":"#9090B0",
 }
 
-FONT_TITLE = ("Segoe UI", 18, "bold")
-FONT_SECTION = ("Segoe UI Semibold", 10)
-FONT_BODY = ("Segoe UI", 10)
-FONT_SMALL = ("Segoe UI", 9)
-FONT_MONO = ("Cascadia Code", 9)
-FONT_TEXT = ("Segoe UI", 12)
-FONT_LOG = ("Cascadia Code", 9)
+FONT_TITLE = (_UI, 18, "bold")
+FONT_SECTION = (_UI_SEMI, 10)
+FONT_BODY = (_UI, 10)
+FONT_SMALL = (_UI, 9)
+FONT_MONO = (_MONO, 9)
+FONT_TEXT = (_UI, 12)
+FONT_LOG = (_MONO, 9)
 
 
 class App(ctk.CTk):
@@ -68,8 +84,8 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("dark")
 
         self.title("VoiceFlow")
-        self.geometry("960x640")
-        self.minsize(800, 520)
+        self.geometry("1080x640")
+        self.minsize(900, 520)
         self.configure(fg_color=COLORS["bg"])
 
         self._engines = get_available_engines()
@@ -95,17 +111,41 @@ class App(ctk.CTk):
         self._session_raw_text = ""
         self._session_text_start = "1.0"
 
+        # Sound feedback
+        self._sound_enabled = tk.BooleanVar(value=True)
+
+        # Session history
+        self._history_data = load_history()
+        self._current_session: dict | None = None
+        self._current_entry: dict | None = None
+        self._history_sidebar_visible = False
+        self._viewing_history = False
+
         # Push-to-Talk state
         self._ptt_active = False
         self._last_hotkey_time = 0.0
+
+        # Pre-compute hotkey display (needed by _set_placeholder)
+        _cfg = get_config()
+        self._hotkey_combo = _cfg.get("hotkey", "") or DEFAULT_HOTKEY
+        self._hotkey_display = format_hotkey_display(self._hotkey_combo)
 
         self._build_ui()
         self._set_dark_titlebar()
         self._set_placeholder()
 
+        # Restore persisted app settings
+        self._restore_config()
+
         self._log("App iniciada.")
         self._log(f"Motores detectados: {', '.join(self._engines.keys()) or 'ninguno'}")
         self._log(f"Editores AI: {', '.join(self._ai_editors.keys()) or 'ninguno'}")
+
+        # Create current session for history
+        self._current_session = create_session(
+            engine=self._engine_var.get(),
+            language=self._language_var.get(),
+        )
 
         if not self._engines:
             self._set_status("No hay motores instalados.", "red")
@@ -119,27 +159,24 @@ class App(ctk.CTk):
         self._ov_audio_levels = [0.0] * 20  # real-time audio RMS per band
         self.after(300, self._create_overlay)
 
-        # Native Win32 keyboard hook for Ctrl+Win
-        # Uses ctypes WH_KEYBOARD_LL — returns 1 directly from the hook
-        # callback to suppress Win key BEFORE Windows processes it.
-        self._hotkey_hook = None
-        if sys.platform == "win32":
-            from hotkey_hook import HotkeyHook
-            self._hotkey_hook = HotkeyHook(
-                on_hotkey_down=self._on_hotkey_down,
-                on_hotkey_up=self._on_hotkey_up,
-            )
-            self._hotkey_hook.start()
-            self._log("Hook de teclado nativo instalado (Ctrl+Win).")
+        # Cross-platform keyboard hook (configurable combo)
+        self._hotkey_hook = HotkeyHook(
+            combo=self._hotkey_combo,
+            on_hotkey_down=self._on_hotkey_down,
+            on_hotkey_up=self._on_hotkey_up,
+        )
+        self._hotkey_hook.start()
+        self._log(f"Hook de teclado instalado ({self._hotkey_display}).")
 
     # ──────────────────────────────────────────────
-    #  Dark Titlebar (Windows)
+    #  Dark Titlebar (Windows only — macOS uses native dark mode)
     # ──────────────────────────────────────────────
 
     def _set_dark_titlebar(self, window=None) -> None:
-        if sys.platform != "win32":
+        if not _IS_WIN:
             return
         try:
+            import ctypes
             w = window or self
             w.update_idletasks()
             hwnd = ctypes.windll.user32.GetParent(w.winfo_id())
@@ -161,6 +198,7 @@ class App(ctk.CTk):
 
         self._build_sidebar()
         self._build_main_panel()
+        self._build_history_sidebar()
 
     # ── SIDEBAR ──────────────────────────────────
 
@@ -184,7 +222,7 @@ class App(ctk.CTk):
         # ── Header: Title + Status ──
         ctk.CTkLabel(
             content, text="VoiceFlow",
-            font=("Segoe UI", 15, "bold"),
+            font=(_UI, 15, "bold"),
             text_color=COLORS["text"], anchor="w"
         ).pack(anchor="w")
 
@@ -199,7 +237,7 @@ class App(ctk.CTk):
             0, 0, 8, 8, fill=COLORS["success"], outline="")
 
         self._lbl_status = ctk.CTkLabel(
-            status_row, text="Listo", font=("Segoe UI", 8),
+            status_row, text="Listo", font=(_UI, 8),
             text_color=COLORS["success"], anchor="w")
         self._lbl_status.pack(side="left", fill="x", expand=True)
 
@@ -229,7 +267,7 @@ class App(ctk.CTk):
         self._model_frame = ctk.CTkFrame(content, fg_color="transparent")
         self._model_frame.pack(fill="x", pady=(0, 3))
 
-        ctk.CTkLabel(self._model_frame, text="Modelo", font=("Segoe UI", 8),
+        ctk.CTkLabel(self._model_frame, text="Modelo", font=(_UI, 8),
                      text_color=COLORS["text_dim"]).pack(side="left", padx=(0, 6))
 
         self._whisper_model_var = tk.StringVar(value="small")
@@ -250,7 +288,7 @@ class App(ctk.CTk):
         self._dg_frame = ctk.CTkFrame(content, fg_color="transparent")
         # Not packed by default — _update_controls_for_engine shows it
 
-        ctk.CTkLabel(self._dg_frame, text="API Key", font=("Segoe UI", 8),
+        ctk.CTkLabel(self._dg_frame, text="API Key", font=(_UI, 8),
                      text_color=COLORS["text_dim"]).pack(side="left", padx=(0, 6))
 
         self._dg_key_var = tk.StringVar(value="")
@@ -266,7 +304,7 @@ class App(ctk.CTk):
             self._dg_frame, text="Guardar", width=60,
             command=self._save_deepgram_key,
             fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
-            text_color="#0B0B0F", font=("Segoe UI", 8, "bold"),
+            text_color="#0B0B0F", font=(_UI, 8, "bold"),
             corner_radius=6, height=28)
         self._dg_save_btn.pack(side="left")
 
@@ -283,7 +321,7 @@ class App(ctk.CTk):
         self._btn_record = ctk.CTkButton(
             btn_row, text="\u26A1  Cargar Motor", command=self._on_load_engine,
             fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
-            text_color="#0B0B0F", font=("Segoe UI", 10, "bold"),
+            text_color="#0B0B0F", font=(_UI, 10, "bold"),
             corner_radius=8, height=34)
         self._btn_record.pack(side="left", fill="x", expand=True)
         self._btn_pulse_id: str | None = None
@@ -291,7 +329,7 @@ class App(ctk.CTk):
         self._btn_cancel = ctk.CTkButton(
             btn_row, text="Cancelar", command=self._on_cancel,
             fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
-            text_color="white", font=("Segoe UI", 9, "bold"),
+            text_color="white", font=(_UI, 9, "bold"),
             corner_radius=8, height=34, width=80)
         # Not packed — shown only during loading
 
@@ -311,7 +349,7 @@ class App(ctk.CTk):
             selected_hover_color=COLORS["accent_hover"],
             unselected_color=COLORS["input_bg"],
             unselected_hover_color=COLORS["surface_hover"],
-            text_color=COLORS["text"], font=("Segoe UI", 8),
+            text_color=COLORS["text"], font=(_UI, 8),
             corner_radius=6, height=26)
         self._seg_audio.pack(fill="x", pady=(0, 4))
 
@@ -328,8 +366,8 @@ class App(ctk.CTk):
             dropdown_fg_color=COLORS["surface"],
             dropdown_hover_color=COLORS["accent_muted"],
             dropdown_text_color=COLORS["text"],
-            text_color=COLORS["text"], font=("Segoe UI", 8),
-            dropdown_font=("Segoe UI", 8), corner_radius=6,
+            text_color=COLORS["text"], font=(_UI, 8),
+            dropdown_font=(_UI, 8), corner_radius=6,
             dynamic_resizing=False, height=28)
         self._combo_mic.pack(side="left", fill="x", expand=True)
 
@@ -353,12 +391,13 @@ class App(ctk.CTk):
         # Left: Idioma
         lang_left = ctk.CTkFrame(lang_row, fg_color="transparent")
         lang_left.pack(side="left", fill="x", expand=True, padx=(0, 3))
-        ctk.CTkLabel(lang_left, text="Entrada", font=("Segoe UI", 8),
+        ctk.CTkLabel(lang_left, text="Entrada", font=(_UI, 8),
                      text_color=COLORS["text_dim"]).pack(anchor="w")
         self._language_var = tk.StringVar(value="Espanol")
         self._combo_language = ctk.CTkOptionMenu(
             lang_left, variable=self._language_var,
             values=list(LANGUAGE_MAP.keys()),
+            command=lambda _: self._persist_settings(),
             fg_color=COLORS["input_bg"], button_color=COLORS["border"],
             button_hover_color=COLORS["surface_hover"],
             dropdown_fg_color=COLORS["surface"],
@@ -371,12 +410,13 @@ class App(ctk.CTk):
         # Right: Traducir a
         lang_right = ctk.CTkFrame(lang_row, fg_color="transparent")
         lang_right.pack(side="left", fill="x", expand=True, padx=(3, 0))
-        ctk.CTkLabel(lang_right, text="Traducir", font=("Segoe UI", 8),
+        ctk.CTkLabel(lang_right, text="Traducir", font=(_UI, 8),
                      text_color=COLORS["text_dim"]).pack(anchor="w")
         self._translate_var = tk.StringVar(value="Ninguno")
         self._combo_translate = ctk.CTkOptionMenu(
             lang_right, variable=self._translate_var,
             values=["Ninguno", "Espanol", "Ingles", "Frances", "Portugues"],
+            command=lambda _: self._persist_settings(),
             fg_color=COLORS["input_bg"], button_color=COLORS["border"],
             button_hover_color=COLORS["surface_hover"],
             dropdown_fg_color=COLORS["surface"],
@@ -400,7 +440,8 @@ class App(ctk.CTk):
         self._switch_direct = ctk.CTkSwitch(
             switches_row, text="Directo",
             variable=self._direct_mode,
-            font=("Segoe UI", 9), text_color=COLORS["text_sec"],
+            command=self._persist_settings,
+            font=(_UI, 9), text_color=COLORS["text_sec"],
             progress_color=COLORS["accent"],
             button_color=COLORS["text"],
             button_hover_color=COLORS["accent_hover"],
@@ -410,12 +451,28 @@ class App(ctk.CTk):
         self._switch_ai = ctk.CTkSwitch(
             switches_row, text="AI Edit",
             variable=self._ai_edit_mode,
-            font=("Segoe UI", 9), text_color=COLORS["text_sec"],
+            command=self._persist_settings,
+            font=(_UI, 9), text_color=COLORS["text_sec"],
             progress_color=COLORS["accent"],
             button_color=COLORS["text"],
             button_hover_color=COLORS["accent_hover"],
             fg_color=COLORS["border"], width=40, height=18)
         self._switch_ai.pack(side="left")
+
+        # Second row: Sound switch
+        switches_row2 = ctk.CTkFrame(content, fg_color="transparent")
+        switches_row2.pack(fill="x", pady=(0, 5))
+
+        self._switch_sound = ctk.CTkSwitch(
+            switches_row2, text="Sonidos",
+            variable=self._sound_enabled,
+            command=self._persist_settings,
+            font=(_UI, 9), text_color=COLORS["text_sec"],
+            progress_color=COLORS["accent"],
+            button_color=COLORS["text"],
+            button_hover_color=COLORS["accent_hover"],
+            fg_color=COLORS["border"], width=40, height=18)
+        self._switch_sound.pack(side="left")
 
         # Activation + Config AI in a row
         opts_row = ctk.CTkFrame(content, fg_color="transparent")
@@ -425,28 +482,44 @@ class App(ctk.CTk):
         self._combo_activation = ctk.CTkOptionMenu(
             opts_row, variable=self._activation_var,
             values=["Mantener (PTT)", "Alternar"],
+            command=lambda _: self._persist_settings(),
             fg_color=COLORS["input_bg"], button_color=COLORS["border"],
             button_hover_color=COLORS["surface_hover"],
             dropdown_fg_color=COLORS["surface"],
             dropdown_hover_color=COLORS["accent_muted"],
             dropdown_text_color=COLORS["text"],
-            text_color=COLORS["text"], font=("Segoe UI", 8),
+            text_color=COLORS["text"], font=(_UI, 8),
             dropdown_font=FONT_SMALL, corner_radius=6, height=28)
         self._combo_activation.pack(side="left", fill="x", expand=True, padx=(0, 4))
 
         ctk.CTkButton(
             opts_row, text="Config AI", command=self._open_ai_config,
             fg_color=COLORS["surface"], hover_color=COLORS["surface_hover"],
-            text_color=COLORS["text_sec"], font=("Segoe UI", 8),
+            text_color=COLORS["text_sec"], font=(_UI, 8),
             corner_radius=6, height=28, width=70
         ).pack(side="left")
 
-        # Hotkey badge — compact
-        badge = ctk.CTkFrame(content, fg_color=COLORS["accent_muted"],
-                             corner_radius=6, height=26)
-        badge.pack(fill="x", pady=(2, 0))
-        ctk.CTkLabel(badge, text="Ctrl + Win", font=("Cascadia Code", 8),
-                     text_color=COLORS["accent"]).pack(pady=2)
+        # Hotkey selector
+        hotkey_frame = ctk.CTkFrame(content, fg_color="transparent")
+        hotkey_frame.pack(fill="x", pady=(2, 0))
+
+        ctk.CTkLabel(hotkey_frame, text="Hotkey", font=(_UI, 8),
+                     text_color=COLORS["text_dim"]).pack(side="left", padx=(0, 4))
+
+        self._hotkey_var = tk.StringVar(value=DEFAULT_HOTKEY)
+        self._combo_hotkey = ctk.CTkOptionMenu(
+            hotkey_frame, variable=self._hotkey_var,
+            values=HOTKEY_PRESETS,
+            command=self._on_hotkey_change,
+            fg_color=COLORS["accent_muted"],
+            button_color=COLORS["accent"],
+            button_hover_color=COLORS["accent_hover"],
+            dropdown_fg_color=COLORS["surface"],
+            dropdown_hover_color=COLORS["accent_muted"],
+            dropdown_text_color=COLORS["text"],
+            text_color=COLORS["accent"], font=(_MONO, 8),
+            dropdown_font=(_MONO, 8), corner_radius=6, height=26)
+        self._combo_hotkey.pack(side="left", fill="x", expand=True)
 
         # Initialize controls
         self._refresh_microphones()
@@ -469,7 +542,7 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(
             action_bar, text="Transcripcion",
-            font=("Segoe UI Semibold", 12),
+            font=(_UI_SEMI, 12),
             text_color=COLORS["text_sec"]
         ).pack(side="left")
 
@@ -479,23 +552,30 @@ class App(ctk.CTk):
         ctk.CTkButton(
             right_actions, text="Copiar", command=self._on_copy,
             fg_color=COLORS["surface"], hover_color=COLORS["surface_hover"],
-            text_color=COLORS["text_sec"], font=("Segoe UI", 9),
+            text_color=COLORS["text_sec"], font=(_UI, 9),
             corner_radius=6, width=65, height=28
         ).pack(side="left", padx=(0, 4))
 
         ctk.CTkButton(
             right_actions, text="Limpiar", command=self._on_clear,
             fg_color=COLORS["surface"], hover_color=COLORS["surface_hover"],
-            text_color=COLORS["text_sec"], font=("Segoe UI", 9),
+            text_color=COLORS["text_sec"], font=(_UI, 9),
             corner_radius=6, width=65, height=28
         ).pack(side="left", padx=(0, 4))
 
         self._btn_log = ctk.CTkButton(
             right_actions, text="Log", command=self._toggle_log,
             fg_color=COLORS["surface"], hover_color=COLORS["surface_hover"],
-            text_color=COLORS["text_sec"], font=("Segoe UI", 9),
+            text_color=COLORS["text_sec"], font=(_UI, 9),
             corner_radius=6, width=45, height=28)
-        self._btn_log.pack(side="left")
+        self._btn_log.pack(side="left", padx=(0, 4))
+
+        self._btn_history = ctk.CTkButton(
+            right_actions, text="Historial", command=self._toggle_history_sidebar,
+            fg_color=COLORS["surface"], hover_color=COLORS["surface_hover"],
+            text_color=COLORS["text_sec"], font=(_UI, 9),
+            corner_radius=6, width=70, height=28)
+        self._btn_history.pack(side="left")
 
         # ── Text Area ──
         self._text_area = ctk.CTkTextbox(
@@ -526,7 +606,7 @@ class App(ctk.CTk):
 
         log_header = ctk.CTkFrame(self._log_frame, fg_color="transparent")
         log_header.pack(fill="x", padx=10, pady=(6, 2))
-        ctk.CTkLabel(log_header, text="LOG", font=("Segoe UI Semibold", 9),
+        ctk.CTkLabel(log_header, text="LOG", font=(_UI_SEMI, 9),
                      text_color=COLORS["section_header"]).pack(side="left")
 
         self._log_text = ctk.CTkTextbox(
@@ -538,11 +618,309 @@ class App(ctk.CTk):
         self._log_text.pack(fill="both", expand=True, padx=8, pady=(0, 6))
         self._log_text.configure(state="disabled")
 
+    # ── HISTORY SIDEBAR ────────────────────────────
+
+    def _build_history_sidebar(self) -> None:
+        """Build the collapsible session history sidebar (right side)."""
+        self._history_panel = ctk.CTkFrame(
+            self._main_container, width=280, fg_color=COLORS["sidebar"],
+            corner_radius=0, border_width=0)
+        # NOT gridded initially — sidebar starts hidden
+        self._history_panel.grid_propagate(False)
+
+        content = ctk.CTkFrame(self._history_panel, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=14, pady=(12, 8))
+
+        # Header row
+        header_row = ctk.CTkFrame(content, fg_color="transparent")
+        header_row.pack(fill="x", pady=(0, 4))
+
+        ctk.CTkLabel(
+            header_row, text="HISTORIAL", font=(_UI_SEMI, 9),
+            text_color=COLORS["section_header"], anchor="w"
+        ).pack(side="left")
+
+        self._lbl_session_count = ctk.CTkLabel(
+            header_row, text="0 sesiones", font=(_UI, 8),
+            text_color=COLORS["text_dim"], anchor="e")
+        self._lbl_session_count.pack(side="right")
+
+        ctk.CTkFrame(content, height=1, fg_color=COLORS["border"]).pack(
+            fill="x", pady=(2, 6))
+
+        # Current session card
+        self._current_session_card = ctk.CTkFrame(
+            content, fg_color=COLORS["accent_muted"], corner_radius=8,
+            border_width=1, border_color=COLORS["accent"])
+        self._current_session_card.pack(fill="x", pady=(0, 6))
+
+        ctk.CTkLabel(
+            self._current_session_card, text="\u25CF SESION ACTUAL",
+            font=(_UI_SEMI, 8), text_color=COLORS["accent"], anchor="w"
+        ).pack(anchor="w", padx=10, pady=(6, 2))
+
+        self._lbl_current_info = ctk.CTkLabel(
+            self._current_session_card, text="Sin entradas",
+            font=(_UI, 8), text_color=COLORS["text_sec"],
+            anchor="w", wraplength=240)
+        self._lbl_current_info.pack(anchor="w", padx=10, pady=(0, 6))
+
+        ctk.CTkFrame(content, height=1, fg_color=COLORS["border"]).pack(
+            fill="x", pady=(2, 6))
+
+        # Scrollable session list
+        self._history_scroll = ctk.CTkScrollableFrame(
+            content, fg_color="transparent",
+            scrollbar_button_color=COLORS["border"],
+            scrollbar_button_hover_color=COLORS["text_dim"])
+        self._history_scroll.pack(fill="both", expand=True, pady=(0, 6))
+
+        # Bottom actions
+        bottom_row = ctk.CTkFrame(content, fg_color="transparent")
+        bottom_row.pack(fill="x", pady=(4, 0))
+
+        self._btn_back_to_live = ctk.CTkButton(
+            bottom_row, text="\u25C0 En vivo", command=self._exit_history_view,
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+            text_color="#0B0B0F", font=(_UI, 8, "bold"),
+            corner_radius=6, height=26)
+        # Not packed — shown only when viewing a past session
+
+        ctk.CTkButton(
+            bottom_row, text="Limpiar todo", command=self._on_clear_history,
+            fg_color=COLORS["surface"], hover_color=COLORS["surface_hover"],
+            text_color=COLORS["text_dim"], font=(_UI, 8),
+            corner_radius=6, height=26
+        ).pack(side="right")
+
+        self._refresh_history_list()
+
+    def _toggle_history_sidebar(self) -> None:
+        if self._history_sidebar_visible:
+            self._history_panel.grid_forget()
+            self._history_sidebar_visible = False
+            self._btn_history.configure(fg_color=COLORS["surface"])
+        else:
+            self._history_panel.grid(row=0, column=2, sticky="nsew")
+            self._history_sidebar_visible = True
+            self._btn_history.configure(fg_color=COLORS["accent_muted"])
+            self._refresh_history_list()
+
+    def _refresh_history_list(self) -> None:
+        for child in self._history_scroll.winfo_children():
+            child.destroy()
+        sessions = self._history_data.get("sessions", [])
+        self._lbl_session_count.configure(text=f"{len(sessions)} sesiones")
+        for session in sessions:
+            self._create_session_card(self._history_scroll, session)
+
+    def _create_session_card(self, parent, session: dict) -> None:
+        card = ctk.CTkFrame(
+            parent, fg_color=COLORS["surface"], corner_radius=8,
+            border_width=1, border_color=COLORS["border"],
+            cursor="hand2")
+        card.pack(fill="x", pady=(0, 4))
+
+        # Top row: date + delete button
+        top_row = ctk.CTkFrame(card, fg_color="transparent")
+        top_row.pack(fill="x", padx=8, pady=(6, 0))
+
+        try:
+            dt = datetime.fromisoformat(session["started_at"])
+            date_str = dt.strftime("%d/%m/%Y  %H:%M")
+        except Exception:
+            date_str = session.get("started_at", "")
+
+        ctk.CTkLabel(
+            top_row, text=date_str, font=(_MONO, 8),
+            text_color=COLORS["text_dim"], anchor="w"
+        ).pack(side="left")
+
+        sid = session["id"]
+        btn_del = ctk.CTkButton(
+            top_row, text="\u2715", width=20, height=18,
+            fg_color="transparent", hover_color=COLORS["danger"],
+            text_color=COLORS["text_dim"], font=(_UI, 9),
+            corner_radius=4,
+            command=lambda s=sid: self._on_delete_session(s))
+        btn_del.pack(side="right")
+
+        # Engine + Language
+        meta = f"{session.get('engine', '?')} \u00b7 {session.get('language', '?')}"
+        ctk.CTkLabel(
+            card, text=meta, font=(_UI, 8),
+            text_color=COLORS["text_sec"], anchor="w"
+        ).pack(anchor="w", padx=8, pady=(1, 0))
+
+        # Text preview
+        preview = get_session_preview(session)
+        if preview:
+            ctk.CTkLabel(
+                card, text=preview, font=(_UI, 9),
+                text_color=COLORS["text"], anchor="w", wraplength=240
+            ).pack(anchor="w", padx=8, pady=(3, 6))
+        else:
+            ctk.CTkLabel(
+                card, text="(vacia)", font=(_UI, 9),
+                text_color=COLORS["text_dim"], anchor="w"
+            ).pack(anchor="w", padx=8, pady=(3, 6))
+
+        # Click to view session
+        def on_click(e, s=session):
+            self._view_session(s)
+
+        card.bind("<ButtonRelease-1>", on_click)
+        for child in card.winfo_children():
+            child.bind("<ButtonRelease-1>", on_click)
+            for sub in child.winfo_children():
+                if not isinstance(sub, ctk.CTkButton):
+                    sub.bind("<ButtonRelease-1>", on_click)
+
+        # Hover effect
+        def on_enter(e, c=card):
+            c.configure(fg_color=COLORS["surface_hover"],
+                        border_color=COLORS["accent"])
+
+        def on_leave(e, c=card):
+            c.configure(fg_color=COLORS["surface"],
+                        border_color=COLORS["border"])
+
+        card.bind("<Enter>", on_enter)
+        card.bind("<Leave>", on_leave)
+        for child in card.winfo_children():
+            child.bind("<Enter>", on_enter)
+            child.bind("<Leave>", on_leave)
+
+    def _view_session(self, session: dict) -> None:
+        self._viewing_history = True
+        self._text_area._textbox.delete("1.0", tk.END)
+
+        for entry in session.get("entries", []):
+            text = entry.get("polished_text") or entry.get("raw_text", "")
+            if text:
+                self._text_area._textbox.insert(tk.END, text)
+
+        self._text_area.configure(state="disabled")
+        self._text_area.see("1.0")
+        self._btn_back_to_live.pack(side="left", padx=(0, 6))
+
+        try:
+            dt = datetime.fromisoformat(session["started_at"])
+            label = dt.strftime("%d/%m %H:%M")
+        except Exception:
+            label = "Sesion"
+        self._set_status(f"Viendo: {label}", "orange")
+
+    def _exit_history_view(self) -> None:
+        self._viewing_history = False
+        self._text_area.configure(state="normal")
+        self._text_area._textbox.delete("1.0", tk.END)
+        self._btn_back_to_live.pack_forget()
+        self._set_placeholder()
+        self._set_status("Listo", "green")
+
+    def _on_delete_session(self, session_id: str) -> None:
+        delete_session(session_id)
+        self._history_data = load_history()
+        self._refresh_history_list()
+
+    def _on_clear_history(self) -> None:
+        clear_history()
+        self._history_data = load_history()
+        self._refresh_history_list()
+        self._log("Historial limpiado.")
+
+    def _update_current_session_card(self) -> None:
+        if self._current_session is None:
+            return
+        entry_count = len(self._current_session.get("entries", []))
+        preview = get_session_preview(self._current_session)
+        if entry_count:
+            info = f"{entry_count} entradas"
+            if preview:
+                info += f" \u00b7 {preview[:60]}"
+            self._lbl_current_info.configure(text=info)
+
+    # ── CONFIG PERSISTENCE ────────────────────────
+
+    def _restore_config(self) -> None:
+        """Restore persisted app settings from config.json."""
+        cfg = get_config()
+
+        # Engine
+        saved_engine = cfg.get("engine", "")
+        if saved_engine and saved_engine in self._engines:
+            self._engine_var.set(saved_engine)
+            self._update_controls_for_engine()
+
+        # Whisper model
+        self._whisper_model_var.set(cfg.get("whisper_model", "small"))
+
+        # Language
+        saved_lang = cfg.get("language", "Espanol")
+        self._language_var.set(saved_lang)
+
+        # Translation
+        self._translate_var.set(cfg.get("translate_to", "Ninguno"))
+
+        # Switches
+        self._direct_mode.set(cfg.get("direct_mode", True))
+        self._ai_edit_mode.set(cfg.get("ai_edit_mode", False))
+        self._sound_enabled.set(cfg.get("sound_enabled", True))
+
+        # Activation mode
+        self._activation_var.set(
+            cfg.get("activation_mode", "Mantener (PTT)"))
+
+        # Audio source
+        saved_audio = cfg.get("audio_source", "Microfono")
+        self._audio_source_var.set(saved_audio)
+        self._on_audio_source_change_seg(saved_audio)
+
+        # Hotkey
+        saved_hotkey = cfg.get("hotkey", "") or DEFAULT_HOTKEY
+        self._hotkey_var.set(saved_hotkey)
+
+    def _persist_settings(self, *_args) -> None:
+        """Save current app settings to config.json (called on any change)."""
+        cfg = get_config()
+        cfg["engine"] = self._engine_var.get()
+        cfg["whisper_model"] = self._whisper_model_var.get()
+        cfg["language"] = self._language_var.get()
+        cfg["translate_to"] = self._translate_var.get()
+        cfg["direct_mode"] = self._direct_mode.get()
+        cfg["ai_edit_mode"] = self._ai_edit_mode.get()
+        cfg["sound_enabled"] = self._sound_enabled.get()
+        cfg["activation_mode"] = self._activation_var.get()
+        cfg["audio_source"] = self._audio_source_var.get()
+        cfg["hotkey"] = self._hotkey_var.get()
+        save_config(cfg)
+
+    def _on_hotkey_change(self, new_combo: str) -> None:
+        """Restart the keyboard hook with a new hotkey combo."""
+        try:
+            self._hotkey_hook.stop()
+        except Exception:
+            pass
+        self._hotkey_combo = new_combo
+        self._hotkey_display = format_hotkey_display(new_combo)
+        self._hotkey_hook = HotkeyHook(
+            combo=new_combo,
+            on_hotkey_down=self._on_hotkey_down,
+            on_hotkey_up=self._on_hotkey_up,
+        )
+        self._hotkey_hook.start()
+        # Update overlay hover label
+        if hasattr(self, "_ov_hover_label") and self._ov_hover_label:
+            self._ov_hover_label.configure(text=self._hotkey_display)
+        self._log(f"Hotkey cambiado: {self._hotkey_display}")
+        self._persist_settings()
+
     # ── UI Helpers ───────────────────────────────
 
     def _build_section_label(self, parent, text: str) -> None:
         ctk.CTkLabel(
-            parent, text=text, font=("Segoe UI Semibold", 9),
+            parent, text=text, font=(_UI_SEMI, 9),
             text_color=COLORS["section_header"], anchor="w"
         ).pack(anchor="w", pady=(0, 3))
 
@@ -555,7 +933,7 @@ class App(ctk.CTk):
         if not content.strip():
             self._text_area._textbox.delete("1.0", tk.END)
             self._text_area._textbox.insert(
-                "1.0", "El texto transcrito aparecera aqui...\n\nPresiona Ctrl+Win para comenzar a dictar.",
+                "1.0", f"El texto transcrito aparecera aqui...\n\nPresiona {self._hotkey_display} para comenzar a dictar.",
                 "placeholder")
             self._has_placeholder = True
 
@@ -608,6 +986,7 @@ class App(ctk.CTk):
             self._mic_frame.pack(fill="x")
         else:
             self._mic_frame.pack_forget()
+        self._persist_settings()
 
     # ──────────────────────────────────────────────
     #  Status Dot & Blink
@@ -715,13 +1094,14 @@ class App(ctk.CTk):
         self._set_status("Cancelando...", "orange")
 
     # ──────────────────────────────────────────────
-    #  Push-to-Talk / Hotkey  (native Win32 hook)
+    #  Push-to-Talk / Hotkey  (cross-platform hook)
     # ──────────────────────────────────────────────
 
     def _on_hotkey_down(self) -> None:
-        """Called from the native hook thread when Ctrl+Win is pressed.
+        """Called from the hook thread when hotkey is pressed.
 
-        The hook has already suppressed Win from reaching the OS.
+        Windows: Ctrl+Win, macOS: Ctrl+Cmd.
+        The hook suppresses the combo from reaching the OS.
         We dispatch to the Tk main thread via after().
         """
         now = time.time()
@@ -738,7 +1118,7 @@ class App(ctk.CTk):
             self.after(0, self._on_hotkey_start_stop)
 
     def _on_hotkey_up(self) -> None:
-        """Called from the native hook thread when Ctrl+Win is released."""
+        """Called from the hook thread when hotkey is released."""
         if self._ptt_active:
             mode = self._activation_var.get() if hasattr(self, "_activation_var") else "Alternar"
             if "Mantener" in mode:
@@ -803,7 +1183,8 @@ class App(ctk.CTk):
             fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
             text_color="#0B0B0F")
         model = self._whisper_model_var.get()
-        self._set_status(f"Modelo: {model}. Cargue motor o use Ctrl+Win.", "orange")
+        self._set_status(f"Modelo: {model}. Cargue motor o use hotkey.", "orange")
+        self._persist_settings()
 
     def _on_engine_change(self) -> None:
         if self._recording:
@@ -816,7 +1197,8 @@ class App(ctk.CTk):
             fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
             text_color="#0B0B0F")
         self._update_controls_for_engine()
-        self._set_status("Motor cambiado. Cargue motor o use Ctrl+Win.", "orange")
+        self._set_status("Motor cambiado. Cargue motor o use hotkey.", "orange")
+        self._persist_settings()
 
     def _on_load_engine(self) -> None:
         if self._loading or self._model_loaded:
@@ -855,7 +1237,7 @@ class App(ctk.CTk):
                 fg_color="#1A3D2A", hover_color="#1A3D2A",
                 text_color=COLORS["success"]))
             self.after(0, self._set_status,
-                       "Motor cargado. Use Ctrl+Win para dictar.", "green")
+                       "Motor cargado. Use hotkey para dictar.", "green")
             self.after(0, self._set_overlay_engine_loaded)
         except CancelledError:
             self._log("Carga cancelada.")
@@ -873,7 +1255,7 @@ class App(ctk.CTk):
                     fg_color=COLORS["success"], hover_color=COLORS["success"],
                     text_color="white"))
                 self.after(0, self._set_status,
-                           "Motor cargado. Use Ctrl+Win para dictar.", "green")
+                           "Motor cargado. Use hotkey para dictar.", "green")
                 self.after(0, self._set_overlay_engine_loaded)
             except Exception as e:
                 self._log(f"ERROR: {e}")
@@ -891,6 +1273,8 @@ class App(ctk.CTk):
             self._start_recording()
 
     def _start_recording(self) -> None:
+        if self._viewing_history:
+            self._exit_history_view()
         engine_name = self._engine_var.get()
         if not engine_name or engine_name not in self._engines:
             self._set_status("Seleccione un motor.", "red")
@@ -1011,7 +1395,7 @@ class App(ctk.CTk):
 
         # Header
         ctk.CTkLabel(
-            dlg, text="Configuracion AI", font=("Segoe UI", 16, "bold"),
+            dlg, text="Configuracion AI", font=(_UI, 16, "bold"),
             text_color=COLORS["text"]
         ).pack(anchor="w", padx=20, pady=(20, 16))
 
@@ -1136,7 +1520,7 @@ class App(ctk.CTk):
         ctk.CTkButton(
             btn_row, text="Guardar", command=on_save,
             fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
-            text_color="#0B0B0F", font=("Segoe UI", 10, "bold"),
+            text_color="#0B0B0F", font=(_UI, 10, "bold"),
             corner_radius=8, width=100, height=34
         ).pack(side="left", padx=(0, 6))
 
@@ -1165,6 +1549,15 @@ class App(ctk.CTk):
 
         self._session_raw_text = ""
         self._session_text_start = self._text_area._textbox.index(tk.END)
+
+        # Update current session metadata
+        if self._current_session is not None:
+            self._current_session["engine"] = self._engine_var.get()
+            self._current_session["language"] = self._language_var.get()
+
+        # Sound feedback
+        if self._sound_enabled.get():
+            play_sound("start")
 
         import numpy as _np
 
@@ -1220,6 +1613,8 @@ class App(ctk.CTk):
 
     def _stop_recording(self) -> None:
         self._recording = False
+        if self._sound_enabled.get():
+            play_sound("stop")
         self._stop_blink()
         self._ov_audio_levels = [0.0] * len(self._ov_audio_levels)
         self._set_overlay_recording(False)
@@ -1283,6 +1678,10 @@ class App(ctk.CTk):
                     target=self._type_in_active_app, args=(polished,),
                     daemon=True).start()
 
+            # Update history entry with polished version
+            if self._current_entry is not None:
+                update_entry_polished(self._current_entry, polished)
+
             self._set_status("Texto pulido", "green")
             self._log(f"[AI] '{raw[:40]}...' -> '{polished[:40]}...'")
         else:
@@ -1327,9 +1726,12 @@ class App(ctk.CTk):
         ov.overrideredirect(True)
         ov.attributes("-topmost", True)
         ov.attributes("-alpha", 0.95)
-        ov.configure(fg_color=self._OV_TRANSPARENT)
-        if sys.platform == "win32":
+        if _IS_WIN:
+            ov.configure(fg_color=self._OV_TRANSPARENT)
             ov.attributes("-transparentcolor", self._OV_TRANSPARENT)
+        else:
+            # macOS: no transparentcolor support, match pill background
+            ov.configure(fg_color=self._OV_BG)
         ov.lift()
         ov.focus_set = lambda: None
 
@@ -1377,16 +1779,16 @@ class App(ctk.CTk):
 
         # --- Hover label (shown above waveform on hover) ---
         self._ov_hover_label = ctk.CTkLabel(
-            self._ov_pill, text="Ctrl + Win",
+            self._ov_pill, text=self._hotkey_display,
             fg_color="transparent", text_color=self._OV_TEXT,
-            font=("Consolas", 9))
+            font=(_MONO, 9))
         # Not packed by default — shown on hover
 
         # --- No-engine label ---
         self._ov_engine_label = ctk.CTkLabel(
             self._ov_inner, text="\u26A1 Cargar Motor",
             fg_color="transparent", text_color=self._OV_TEXT,
-            font=("Segoe UI", 9), cursor="hand2")
+            font=(_UI, 9), cursor="hand2")
         self._ov_engine_label.bind("<ButtonRelease-1>",
                                     lambda e: self._ov_on_load_engine())
 
@@ -1735,6 +2137,11 @@ class App(ctk.CTk):
         self._text_area.see("end")
         self._session_raw_text += text
 
+        # Track in session history
+        if not self._viewing_history and self._current_session is not None:
+            self._current_entry = add_entry(self._current_session, text)
+            self._update_current_session_card()
+
         if self._direct_mode.get() and not self._ai_edit_mode.get():
             threading.Thread(
                 target=self._type_in_active_app, args=(text,),
@@ -1774,6 +2181,14 @@ class App(ctk.CTk):
     # ──────────────────────────────────────────────
 
     def destroy(self) -> None:
+        # Save current session to history if it has entries
+        try:
+            if self._current_session and self._current_session.get("entries"):
+                finalize_session(self._current_session)
+                save_session_to_history(self._current_session)
+        except Exception:
+            pass
+
         self._cancel_event.set()
         self._stop_blink()
         if self._ov_anim_id is not None:

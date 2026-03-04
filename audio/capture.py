@@ -1,3 +1,4 @@
+import sys
 import threading
 from typing import Callable, Optional
 
@@ -84,7 +85,11 @@ class AudioCapture:
 
 
 class LoopbackCapture:
-    """Captures system audio (what the PC is playing) via WASAPI loopback."""
+    """Captures system audio (what the PC is playing) via loopback.
+
+    Windows: Uses WASAPI loopback via soundcard.
+    macOS:   Requires a virtual audio device (e.g., BlackHole).
+    """
 
     SAMPLE_RATE = 16000
     CHANNELS = 1
@@ -107,26 +112,45 @@ class LoopbackCapture:
         self._thread.start()
 
     def _capture_loop(self) -> None:
-        import soundcard as sc
+        try:
+            import soundcard as sc
+        except ImportError:
+            print(
+                "Loopback capture requires the 'soundcard' package.\n"
+                "  pip install soundcard"
+            )
+            self._running = False
+            return
 
-        speaker = sc.default_speaker()
-        num_frames = int(self.SAMPLE_RATE * self.BLOCK_DURATION)
-        with speaker.recorder(
-            samplerate=self.SAMPLE_RATE,
-            channels=self.CHANNELS,
-            blocksize=num_frames,
-        ) as recorder:
-            while self._running:
-                try:
-                    data = recorder.record(numframes=num_frames)
-                    # soundcard returns (frames, channels) float64
-                    chunk = data[:, 0].astype(np.float32)
-                    if self._callback is not None:
-                        self._callback(chunk)
-                except Exception as e:
-                    if self._running:
-                        print(f"Loopback capture error: {e}")
-                    break
+        try:
+            speaker = sc.default_speaker()
+            num_frames = int(self.SAMPLE_RATE * self.BLOCK_DURATION)
+            with speaker.recorder(
+                samplerate=self.SAMPLE_RATE,
+                channels=self.CHANNELS,
+                blocksize=num_frames,
+            ) as recorder:
+                while self._running:
+                    try:
+                        data = recorder.record(numframes=num_frames)
+                        # soundcard returns (frames, channels) float64
+                        chunk = data[:, 0].astype(np.float32)
+                        if self._callback is not None:
+                            self._callback(chunk)
+                    except Exception as e:
+                        if self._running:
+                            print(f"Loopback capture error: {e}")
+                        break
+        except Exception as e:
+            msg = f"Loopback capture error: {e}"
+            if sys.platform == "darwin":
+                msg += (
+                    "\n  Note: System audio capture on macOS requires a virtual"
+                    " audio device such as BlackHole."
+                    "\n  Install from: https://github.com/ExistentialAudio/BlackHole"
+                )
+            print(msg)
+            self._running = False
 
     def stop(self) -> None:
         """Stop capturing system audio."""

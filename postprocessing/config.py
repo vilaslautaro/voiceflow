@@ -5,12 +5,24 @@ from typing import Optional
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json")
 
 _DEFAULTS = {
+    # AI provider / keys
     "ai_provider": "OpenAI",
     "openai_api_key": "",
     "anthropic_api_key": "",
     "deepgram_api_key": "",
     "ollama_model": "llama3",
     "ollama_url": "http://localhost:11434",
+    # App settings (persisted across sessions)
+    "engine": "",
+    "whisper_model": "small",
+    "language": "Espanol",
+    "translate_to": "Ninguno",
+    "direct_mode": True,
+    "ai_edit_mode": False,
+    "activation_mode": "Mantener (PTT)",
+    "audio_source": "Microfono",
+    "sound_enabled": True,
+    "hotkey": "",  # empty = platform default (Alt+Z win, Ctrl+Cmd mac)
 }
 
 
